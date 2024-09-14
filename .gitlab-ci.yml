@@ -1,0 +1,118 @@
+variables:
+  DEPLOY_USER: "deployer"
+  CI_PROJECT_DIR: "ciproject"
+  BRANCH: "ci_trading_desk"
+  domain: "nikita.space"
+stages:
+  - build
+  - Django
+  - deploy
+
+.default_before_script: &default_before_script
+  - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+  - eval $(ssh-agent -s)
+  - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+  - mkdir -p ~/.ssh
+  - chmod 700 ~/.ssh
+  - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+  - ssh-keyscan $REMOTE_HOST >> ~/.ssh/known_hosts
+  - ssh-keyscan $domain >> ~/.ssh/known_hosts  
+
+build_backend:
+  stage: build
+  tags:
+    - kaniko
+  image: 
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    # Setup Docker registry authentication
+    - echo "{\"auths\":{\"$REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - cat /kaniko/.docker/config.json
+    # - ip a
+    # - pwd
+    # - ls -lah
+    - touch backend/.env
+    # - ls -lah backend/
+    - echo "$ENV_BACKEND" > backend/.env
+    - chmod -R 777 /builds/devops/$CI_PROJECT_DIR
+    # Run Kaniko to build the Docker image
+    - /kaniko/executor --context backend --dockerfile backend/Dockerfile --destination ghcr.io/nikwazup/backend-trading-desk:latest --verbosity=info
+
+  only:
+    - ci_trading_desk
+  when: manual               
+
+
+build_frontend:
+  stage: build
+  tags:
+    - kaniko
+  image: 
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    # Setup Docker registry authentication
+    - echo "{\"auths\":{\"$REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - cat /kaniko/.docker/config.json
+    - ip a
+    - touch frontend/.env
+    - echo "$ENV_FRONT" > frontend/.env
+    - chmod -R 777 /builds/devops/$CI_PROJECT_DIR
+    # Run Kaniko to build the Docker image
+    - /kaniko/executor --context frontend --dockerfile frontend/Dockerfile --destination ghcr.io/nikwazup/frontend-trading-desk:latest --verbosity=info
+  only:
+    - ci_trading_desk
+  when: manual      
+
+rollback_migrations:
+  stage: Django
+  tags:
+    - kaniko  
+  image: debian:bullseye-slim
+  before_script: *default_before_script
+  script:
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "docker exec ciproject_backend_1 chmod +x rollback.sh && docker exec ciproject_backend_1 ./rollback.sh"
+    # - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "export DJANGO_SETTINGS_MODULE=backend.settings && docker exec ciproject_backend_1 chmod +x rollback_migrations.py && docker exec ciproject_backend_1 python rollback_migrations.py"
+  only:
+    - ci_trading_desk   
+  when: manual
+  allow_failure: true
+
+check_django:
+  stage: Django
+  tags: 
+    - kaniko
+  image: debian:bullseye-slim  
+  before_script: *default_before_script  
+  script:
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "docker exec ciproject_backend_1 python manage.py check"
+  only:
+    - ci_trading_desk   
+  when: manual
+
+deploy:
+  stage: deploy
+  tags:
+    - deploy
+  image: debian:bullseye-slim  
+  before_script: *default_before_script 
+  script:
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "echo 'Successfully connected'"
+    # - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "mkdir -p ~/.ssh && touch ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "ssh-keyscan $domain >> ~/.ssh/known_hosts"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "ssh -T $domain"
+    # - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "sudo rm -rf /home/$DEPLOY_USER/$CI_PROJECT_DIR"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "mkdir -p /home/$DEPLOY_USER/$CI_PROJECT_DIR"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "if [ ! -d /home/$DEPLOY_USER/$CI_PROJECT_DIR/.git ]; then git clone git@g$domain:devops/$CI_PROJECT_DIR.git -b $BRANCH /home/$DEPLOY_USER/$CI_PROJECT_DIR; else echo 'Repository already cloned'; fi"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "cd /home/$DEPLOY_USER/$CI_PROJECT_DIR && git pull"
+    # - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "docker pull $IMAGE_BACKEND"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "echo $CI_REGISTRY_PASSWORD | docker login $REGISTRY -u $CI_REGISTRY_USER --password-stdin && docker pull $IMAGE_BACKEND"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "echo "$ENV_FRONT" > /home/$DEPLOY_USER/$CI_PROJECT_DIR/backend/.env"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "echo "$ENV_FRONT" > /home/$DEPLOY_USER/$CI_PROJECT_DIR/frontend/.env"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST " export IMAGE_FRONTEND=$IMAGE_FRONTEND && export IMAGE_BACKEND=$IMAGE_BACKEND &&  echo 'IMAGE_FRONTEND='$IMAGE_FRONTEND &&  echo 'IMAGE_BACKEND='$IMAGE_BACKEND &&  cd /home/$DEPLOY_USER/$CI_PROJECT_DIR &&  cat /home/$DEPLOY_USER/$CI_PROJECT_DIR/docker-compose.yml &&  docker-compose down &&  docker-compose up -d"
+    - ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$REMOTE_HOST "docker ps"
+  only:
+    - ci_trading_desk
+  when: manual
+  allow_failure: false
